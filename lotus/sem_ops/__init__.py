@@ -3,6 +3,7 @@ __all__ = [
     "sem_filter",
     "sem_agg",
     "sem_join",
+    "sem_lineage",
     "sem_topk",
     "sem_extract",
     "sem_index",
