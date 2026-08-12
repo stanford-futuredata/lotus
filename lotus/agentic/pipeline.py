@@ -21,7 +21,7 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .loop import Completer, LiteLLMCompleter, run_agent
 from .ops import FILTER, MAP, REDUCE, normalize_ops
@@ -77,6 +77,10 @@ class Result:
     ``output`` is set when the pipeline ends on a terminal op (``reduce``); ``corpus`` is
     set when it ends on a corpus op (``map``/``filter``). ``findings`` holds the per-shard
     outputs of the ``map`` op, when one ran.
+
+    ``events`` is the flattened agent event log (tool calls + finals) across every
+    op/shard, ready for provenance operators such as ``sem_lineage``. Use
+    :meth:`events_dataframe` for a tabular view.
     """
 
     ops: list[str]
@@ -85,6 +89,28 @@ class Result:
     output: str | None = None
     corpus: "Corpus | None" = None
     findings: list[str] | None = None
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+    def events_dataframe(self):
+        """Return ``events`` as a pandas DataFrame (empty DF if none)."""
+        import pandas as pd
+
+        if not self.events:
+            return pd.DataFrame(
+                columns=[
+                    "event_id",
+                    "session_id",
+                    "unit_id",
+                    "op",
+                    "step",
+                    "event_type",
+                    "tool",
+                    "arguments",
+                    "result",
+                    "content",
+                ]
+            )
+        return pd.DataFrame(self.events)
 
 
 def _default_completer_factory(lm) -> Callable[[list["Tool"]], Completer]:
@@ -179,6 +205,52 @@ def _parse_batched(text: str, kind: str) -> dict[str, str]:
     return result
 
 
+def _flatten_agent_trace(
+    *,
+    session_id: str,
+    unit_ids: list[str],
+    op: str,
+    trace: list[dict[str, Any]],
+    final_output: str | None = None,
+) -> list[dict[str, Any]]:
+    """Turn one ``AgentResult.trace`` (+ optional final text) into event rows."""
+    rows: list[dict[str, Any]] = []
+    unit_id = unit_ids[0] if len(unit_ids) == 1 else ",".join(unit_ids)
+    for step, event in enumerate(trace):
+        args = event.get("arguments", {})
+        rows.append(
+            {
+                "event_id": f"{session_id}:{step}",
+                "session_id": session_id,
+                "unit_id": unit_id,
+                "op": op,
+                "step": step,
+                "event_type": "tool_call",
+                "tool": event.get("tool"),
+                "arguments": json.dumps(args, default=str) if not isinstance(args, str) else args,
+                "result": event.get("result"),
+                "content": None,
+            }
+        )
+    if final_output is not None:
+        step = len(trace)
+        rows.append(
+            {
+                "event_id": f"{session_id}:{step}",
+                "session_id": session_id,
+                "unit_id": unit_id,
+                "op": op,
+                "step": step,
+                "event_type": "final",
+                "tool": None,
+                "arguments": None,
+                "result": None,
+                "content": final_output,
+            }
+        )
+    return rows
+
+
 def _run_op_shard(
     completer: Completer,
     tools: list["Tool"],
@@ -188,8 +260,8 @@ def _run_op_shard(
     shard: list["Unit"],
     context: str | None,
     max_steps: int,
-) -> tuple[list[tuple["Unit", str]], dict[str, int]]:
-    """Run one shard's agent; return per-unit ``(unit, result_text)`` pairs + usage."""
+) -> tuple[list[tuple["Unit", str]], dict[str, int], list[dict[str, Any]]]:
+    """Run one shard's agent; return pairs, usage, and flattened event rows."""
     batched = len(shard) > 1
     res = run_agent(
         completer,
@@ -198,8 +270,17 @@ def _run_op_shard(
         user_content=_op_user_content(kind, instruction, shard, context, batched),
         max_steps=max_steps,
     )
+    unit_ids = [u.id for u in shard]
+    session_id = f"{kind}:{'-'.join(unit_ids)}"
+    events = _flatten_agent_trace(
+        session_id=session_id,
+        unit_ids=unit_ids,
+        op=kind,
+        trace=res.trace,
+        final_output=res.output,
+    )
     if not batched:
-        return [(shard[0], res.output)], res.usage
+        return [(shard[0], res.output)], res.usage, events
 
     parsed = _parse_batched(res.output, kind)
     pairs: list[tuple["Unit", str]] = []
@@ -209,7 +290,7 @@ def _run_op_shard(
         else:
             logger.warning("agentic %s: batched output missing unit '%s'; using default.", kind, u.id)
             pairs.append((u, "VERDICT: KEEP" if kind == FILTER else u.content))
-    return pairs, res.usage
+    return pairs, res.usage, events
 
 
 def _run_agentic_op(
@@ -226,22 +307,24 @@ def _run_agentic_op(
     parallelism: int,
     max_steps: int,
     usage: dict[str, int],
+    events_out: list[dict[str, Any]],
 ) -> list[tuple["Unit", str]]:
     """Shard per the strategy, run one agent per shard in parallel, and return per-unit
-    ``(unit, result_text)`` pairs in corpus order."""
+    ``(unit, result_text)`` pairs in corpus order. Appends event rows to ``events_out``."""
     size = max(2, shard_size or 2) if strategy == "batched" else 1
     shards = corpus.shard(size)
 
-    def _one(shard: list["Unit"]) -> tuple[list[tuple["Unit", str]], dict[str, int]]:
+    def _one(shard: list["Unit"]) -> tuple[list[tuple["Unit", str]], dict[str, int], list[dict[str, Any]]]:
         return _run_op_shard(completer, tools, system, kind, instruction, shard, context, max_steps)
 
     with ThreadPoolExecutor(max_workers=max(1, parallelism)) as ex:
         shard_outs = list(ex.map(_one, shards))
 
     pairs: list[tuple["Unit", str]] = []
-    for prs, u in shard_outs:
+    for prs, u, evs in shard_outs:
         pairs.extend(prs)
         _merge_usage(usage, u)
+        events_out.extend(evs)
     return pairs
 
 
@@ -259,6 +342,7 @@ def _op_map(
     parallelism: int,
     max_steps: int,
     usage: dict[str, int],
+    events_out: list[dict[str, Any]],
 ) -> tuple["Corpus", list[str]]:
     """Corpus -> Corpus. Each unit is transformed to a new unit (one output per unit)."""
     from lotus.corpus import Corpus, Unit
@@ -266,7 +350,7 @@ def _op_map(
     pairs = _run_agentic_op(
         corpus, MAP, instruction, strategy=strategy, context=context, completer=completer,
         tools=tools, system=system, shard_size=shard_size, parallelism=parallelism,
-        max_steps=max_steps, usage=usage,
+        max_steps=max_steps, usage=usage, events_out=events_out,
     )
     units = [Unit(id=u.id, content=r, metadata={"op": "map", "source_id": u.id}) for u, r in pairs]
     findings = [r for _, r in pairs]
@@ -286,6 +370,7 @@ def _op_filter(
     parallelism: int,
     max_steps: int,
     usage: dict[str, int],
+    events_out: list[dict[str, Any]],
 ) -> "Corpus":
     """Corpus -> Corpus (subset). Filter is ``map`` projected to a keep/drop verdict per unit."""
     from lotus.corpus import Corpus
@@ -293,7 +378,7 @@ def _op_filter(
     pairs = _run_agentic_op(
         corpus, FILTER, instruction, strategy=strategy, context=context, completer=completer,
         tools=tools, system=system, shard_size=shard_size, parallelism=parallelism,
-        max_steps=max_steps, usage=usage,
+        max_steps=max_steps, usage=usage, events_out=events_out,
     )
     return Corpus([u for u, r in pairs if _parse_verdict(r)])
 
@@ -307,6 +392,7 @@ def _op_reduce(
     system: str,
     max_steps: int,
     usage: dict[str, int],
+    events_out: list[dict[str, Any]],
 ) -> str:
     """Corpus -> single answer (terminal). One agent aggregates all current units.
 
@@ -322,6 +408,15 @@ def _op_reduce(
         max_steps=max_steps,
     )
     _merge_usage(usage, res.usage)
+    events_out.extend(
+        _flatten_agent_trace(
+            session_id="reduce:all",
+            unit_ids=[u.id for u in corpus.units],
+            op=REDUCE,
+            trace=res.trace,
+            final_output=res.output,
+        )
+    )
     return res.output
 
 
@@ -392,6 +487,7 @@ def run_pipeline(
     current: "Corpus | None" = corpus
     findings: list[str] | None = None
     output: str | None = None
+    events: list[dict[str, Any]] = []
 
     for op in op_list:
         assert current is not None  # a terminal op is always last (validated in normalize_ops)
@@ -408,6 +504,7 @@ def run_pipeline(
                 parallelism=the_plan.parallelism,
                 max_steps=max_steps,
                 usage=usage,
+                events_out=events,
             )
         elif op == FILTER:
             current = _op_filter(
@@ -422,6 +519,7 @@ def run_pipeline(
                 parallelism=the_plan.parallelism,
                 max_steps=max_steps,
                 usage=usage,
+                events_out=events,
             )
         elif op == REDUCE:
             output = _op_reduce(
@@ -432,11 +530,18 @@ def run_pipeline(
                 system=_REDUCE_SYSTEM + guidance,
                 max_steps=max_steps,
                 usage=usage,
+                events_out=events,
             )
             current = None  # collapsed to a single answer
 
     return Result(
-        ops=op_list, plan=the_plan, usage=usage, output=output, corpus=current, findings=findings
+        ops=op_list,
+        plan=the_plan,
+        usage=usage,
+        output=output,
+        corpus=current,
+        findings=findings,
+        events=events,
     )
 
 

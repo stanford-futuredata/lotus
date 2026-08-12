@@ -156,6 +156,67 @@ def test_map_reduce_pipeline_end_to_end():
     assert res.plan is plan
 
 
+def test_pipeline_retains_agent_events():
+    """Tool calls + finals from every map shard and the reduce are kept on Result."""
+
+    @tool(description="Echo a string.")
+    def echo(x: str) -> str:
+        return x
+
+    class ToolThenFinal:
+        """One tool call then a text final per conversation; reduce returns REDUCED."""
+
+        def __call__(self, messages, *, tools_enabled: bool = True):
+            texts = "\n".join(
+                m.get("content") or "" for m in messages if isinstance(m.get("content"), str)
+            )
+            if "PER-SHARD FINDINGS" in texts:
+                return AgentStep(content="REDUCED: all")
+            if tools_enabled and not any(m.get("role") == "tool" for m in messages):
+                return AgentStep(tool_calls=[ToolCall(id="c1", name="echo", arguments={"x": "hi"})])
+            marker = "?"
+            for m in messages:
+                c = m.get("content") or ""
+                if "[unit " in c:
+                    marker = c.split("[unit ", 1)[1].split("]", 1)[0]
+                    break
+            return AgentStep(content=f"finding for {marker}")
+
+    corpus = Corpus.from_documents(["alpha", "beta"], ids=["A", "B"])
+    plan = Plan(
+        ops=["map", "reduce"],
+        instructions={"map": "summarize", "reduce": "combine"},
+        shard_size=1,
+        parallelism=2,
+    )
+    res = run_pipeline(
+        corpus,
+        task="dummy",
+        ops=["map", "reduce"],
+        plan=plan,
+        tools=[echo],
+        completer_factory=lambda tools: ToolThenFinal(),
+        lm=object(),
+        max_steps=5,
+    )
+    assert res.output == "REDUCED: all"
+    assert len(res.events) > 0
+
+    df = res.events_dataframe()
+    assert set(df["op"]) >= {"map", "reduce"}
+    assert set(df["event_type"]) >= {"tool_call", "final"}
+
+    map_tool = df[(df["op"] == "map") & (df["event_type"] == "tool_call")]
+    assert len(map_tool) == 2
+    assert set(map_tool["tool"]) == {"echo"}
+    assert set(map_tool["unit_id"]) == {"A", "B"}
+
+    finals = df[df["event_type"] == "final"]
+    assert set(finals[finals["op"] == "map"]["unit_id"]) == {"A", "B"}
+    assert (finals["op"] == "reduce").sum() == 1
+    assert "REDUCED" in finals[finals["op"] == "reduce"]["content"].iloc[0]
+
+
 def test_pipeline_respects_parallelism_cap():
     corpus = Corpus.from_documents(["a", "b"])
     plan = Plan(
