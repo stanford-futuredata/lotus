@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -159,11 +158,18 @@ def test_sem_lineage_accessor_scopes_by_session():
     model.count_tokens.return_value = 1
     model.is_deepseek.return_value = False
     model.side_effect = lambda inputs, **kwargs: LMOutput(outputs=responses[: len(inputs)])
-    # Disable operator cache for mocked LM identity.
-    model.__dict__  # touch
     lotus.settings.configure(lm=model, enable_cache=False)
 
     result = claims.sem_lineage(events, claim_col="claim", session_col="session_id")
     assert result["supported"].tolist() == [True, False]
     assert result["evidence_event_ids"].iloc[0] == ["s0:0"]
     assert result["evidence_event_ids"].iloc[1] == []
+
+
+def test_offline_lineage_eval_precision_lift():
+    """Naive all-events baseline should be less precise than lineage-style selection."""
+    from examples.op_examples.lineage_eval import main
+
+    metrics = main()
+    assert metrics["lineage_precision"] > metrics["naive_precision"]
+    assert metrics["relative_precision_improvement"] > 0
