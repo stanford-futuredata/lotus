@@ -21,7 +21,7 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .loop import Completer, LiteLLMCompleter, run_agent
 from .ops import FILTER, MAP, REDUCE, normalize_ops
@@ -30,6 +30,8 @@ from .planner import DEFAULT_PARALLELISM_CAP, Plan, derive_plan
 if TYPE_CHECKING:
     from lotus.corpus import Corpus, Unit
     from lotus.tools.base import Tool
+
+    from .cascade import AgenticCascadeArgs
 
 logger = logging.getLogger("lotus")
 
@@ -76,7 +78,8 @@ class Result:
 
     ``output`` is set when the pipeline ends on a terminal op (``reduce``); ``corpus`` is
     set when it ends on a corpus op (``map``/``filter``). ``findings`` holds the per-shard
-    outputs of the ``map`` op, when one ran.
+    outputs of the ``map`` op, when one ran. ``cascade_stats`` is set when an agentic
+    filter cascade ran.
     """
 
     ops: list[str]
@@ -85,6 +88,7 @@ class Result:
     output: str | None = None
     corpus: "Corpus | None" = None
     findings: list[str] | None = None
+    cascade_stats: Any | None = None
 
 
 def _default_completer_factory(lm) -> Callable[[list["Tool"]], Completer]:
@@ -286,16 +290,41 @@ def _op_filter(
     parallelism: int,
     max_steps: int,
     usage: dict[str, int],
-) -> "Corpus":
-    """Corpus -> Corpus (subset). Filter is ``map`` projected to a keep/drop verdict per unit."""
+    cascade_args: "AgenticCascadeArgs | None" = None,
+) -> tuple["Corpus", Any | None]:
+    """Corpus -> Corpus (subset). Filter is ``map`` projected to a keep/drop verdict per unit.
+
+    When ``cascade_args`` is set, runs a proxy→oracle cascade with recall/precision
+    targets instead of a full tool-using agent on every unit.
+    """
     from lotus.corpus import Corpus
+
+    from .cascade import AgenticCascadeArgs, run_agentic_filter_cascade
+
+    if cascade_args is not None:
+        if not isinstance(cascade_args, AgenticCascadeArgs):
+            raise TypeError("cascade_args must be an AgenticCascadeArgs instance")
+        return run_agentic_filter_cascade(
+            corpus,
+            instruction,
+            cascade_args=cascade_args,
+            context=context,
+            completer=completer,
+            tools=tools,
+            system=system,
+            parallelism=parallelism,
+            max_steps=max_steps,
+            usage=usage,
+            parse_verdict=_parse_verdict,
+            merge_usage=_merge_usage,
+        )
 
     pairs = _run_agentic_op(
         corpus, FILTER, instruction, strategy=strategy, context=context, completer=completer,
         tools=tools, system=system, shard_size=shard_size, parallelism=parallelism,
         max_steps=max_steps, usage=usage,
     )
-    return Corpus([u for u, r in pairs if _parse_verdict(r)])
+    return Corpus([u for u, r in pairs if _parse_verdict(r)]), None
 
 
 def _op_reduce(
@@ -339,6 +368,7 @@ def run_pipeline(
     max_parallelism: int | str = "auto",
     max_steps: int = 6,
     verify: bool = False,  # reserved for Phase 2 (sandbox re-check)
+    cascade_args: "AgenticCascadeArgs | None" = None,
     lm=None,
     completer_factory: Callable[[list["Tool"]], Completer] | None = None,
 ) -> Result:
@@ -348,7 +378,11 @@ def run_pipeline(
     optional per-op override, keyed by op name (otherwise the planner derives each).
     ``strategies``/``contexts`` optionally override the per-op execution strategy
     (``"per_unit"`` | ``"batched"`` | ``"shared_context"``) and its shared context.
+
+    ``cascade_args`` enables an accuracy-targeted proxy→oracle cascade on ``filter``
+    ops (cheap no-tool proxy; escalate uncertain units to the full tool-using agent).
     """
+    del verify  # reserved
     op_list = normalize_ops(ops)
     tools = tools or []
     overrides = dict(instructions or {})
@@ -392,6 +426,7 @@ def run_pipeline(
     current: "Corpus | None" = corpus
     findings: list[str] | None = None
     output: str | None = None
+    cascade_stats = None
 
     for op in op_list:
         assert current is not None  # a terminal op is always last (validated in normalize_ops)
@@ -410,7 +445,7 @@ def run_pipeline(
                 usage=usage,
             )
         elif op == FILTER:
-            current = _op_filter(
+            current, cascade_stats = _op_filter(
                 current,
                 _instruction(op),
                 strategy=_strategy(op),
@@ -422,6 +457,7 @@ def run_pipeline(
                 parallelism=the_plan.parallelism,
                 max_steps=max_steps,
                 usage=usage,
+                cascade_args=cascade_args,
             )
         elif op == REDUCE:
             output = _op_reduce(
@@ -436,7 +472,13 @@ def run_pipeline(
             current = None  # collapsed to a single answer
 
     return Result(
-        ops=op_list, plan=the_plan, usage=usage, output=output, corpus=current, findings=findings
+        ops=op_list,
+        plan=the_plan,
+        usage=usage,
+        output=output,
+        corpus=current,
+        findings=findings,
+        cascade_stats=cascade_stats,
     )
 
 
