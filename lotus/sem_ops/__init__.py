@@ -10,6 +10,7 @@ __all__ = [
     "load_sem_index",
     "sem_sim_join",
     "sem_cluster_by",
+    "sem_group_by",
     "sem_partition_by",
     "sem_dedup",
 ]
