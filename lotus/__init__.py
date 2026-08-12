@@ -18,6 +18,7 @@ from lotus.sem_ops import (
     sem_search,
     sem_sim_join,
     sem_cluster_by,
+    sem_group_by,
     sem_dedup,
     sem_topk,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "load_sem_index",
     "sem_sim_join",
     "sem_cluster_by",
+    "sem_group_by",
     "sem_search",
     "sem_dedup",
     "settings",
