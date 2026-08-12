@@ -1,5 +1,6 @@
 """Agentic operators for LOTUS: composable agent ops (map / filter / reduce) over a corpus."""
 
+from .cascade import AgenticCascadeArgs, AgenticCascadeStats, parse_confidence, proxy_keep_score
 from .loop import AgentResult, AgentStep, LiteLLMCompleter, ToolCall, run_agent
 from .ops import CORPUS_OPS, DEFAULT_OPS, FILTER, MAP, OPS, REDUCE, TERMINAL_OPS, normalize_ops
 from .pipeline import Result, run_pipeline
@@ -23,4 +24,8 @@ __all__ = [
     "AgentStep",
     "ToolCall",
     "LiteLLMCompleter",
+    "AgenticCascadeArgs",
+    "AgenticCascadeStats",
+    "parse_confidence",
+    "proxy_keep_score",
 ]

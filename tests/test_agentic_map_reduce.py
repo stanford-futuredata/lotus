@@ -201,6 +201,54 @@ def test_parse_verdict_keep_drop_and_default():
     assert _parse_verdict("no clear verdict here") is True  # ambiguous -> keep (never silently drop)
 
 
+def test_parse_confidence_and_proxy_keep_score():
+    from lotus.agentic.cascade import parse_confidence, proxy_keep_score
+
+    assert parse_confidence("VERDICT: KEEP\nCONFIDENCE: 0.9") == 0.9
+    assert parse_confidence("no conf here") == 0.5
+    assert proxy_keep_score("VERDICT: KEEP\nCONFIDENCE: 0.8", _parse_verdict) == 0.8
+    assert proxy_keep_score("VERDICT: DROP\nCONFIDENCE: 0.8", _parse_verdict) == pytest.approx(0.2)
+
+
+def test_agentic_filter_cascade_with_fixed_thresholds():
+    """High-confidence proxy decisions skip the oracle; mid-band units escalate."""
+    from lotus.agentic import AgenticCascadeArgs
+
+    class CascadeAwareFake:
+        def __call__(self, messages, *, tools_enabled: bool = True):
+            last = messages[-1]["content"]
+            marker = last.split("[unit ", 1)[1].split("]", 1)[0] if "[unit " in last else "?"
+            # Proxy path asks for CONFIDENCE; oracle path does not.
+            if "CONFIDENCE:" in last:
+                if marker == "A":
+                    return AgentStep(content="VERDICT: KEEP\nCONFIDENCE: 0.95")
+                if marker == "B":
+                    return AgentStep(content="VERDICT: DROP\nCONFIDENCE: 0.95")
+                return AgentStep(content="VERDICT: KEEP\nCONFIDENCE: 0.5")  # mid → escalate
+            # Oracle: keep C
+            return AgentStep(content=f"Assessed {marker}. VERDICT: KEEP")
+
+    corpus = Corpus.from_documents(["a", "b", "c"], ids=["A", "B", "C"])
+    cascade = AgenticCascadeArgs(
+        filter_pos_cascade_threshold=0.8,
+        filter_neg_cascade_threshold=0.2,
+    )
+    res = run_pipeline(
+        corpus,
+        "t",
+        ops=["filter"],
+        plan=_plan(["filter"]),
+        completer_factory=lambda tools: CascadeAwareFake(),
+        lm=object(),
+        cascade_args=cascade,
+    )
+    assert [u.id for u in res.corpus.units] == ["A", "C"]
+    assert res.cascade_stats is not None
+    assert res.cascade_stats.proxy_calls == 3
+    assert res.cascade_stats.oracle_calls == 1  # only C escalated
+    assert res.cascade_stats.accepted_by_proxy == 2
+
+
 # ------------------------------------------------------------- composable ops e2e
 class OpAwareFake:
     """Op-aware stateless fake: detects the op from the system prompt.
