@@ -219,3 +219,39 @@ def filter_postprocess(
     boolean_outputs = [process_outputs(answer) for answer in outputs]
 
     return SemanticFilterPostprocessOutput(raw_outputs=llm_answers, outputs=boolean_outputs, explanations=explanations)
+
+
+def lineage_postprocess(
+    llm_answers: list[str],
+    model: lotus.models.LM,
+    cot_reasoning: bool = False,
+) -> tuple[list[dict[str, Any]], list[str | None]]:
+    """Parse lineage JSON answers into structured dicts.
+
+    Expected keys: supported, evidence_event_ids, lineage_path, rationale.
+    """
+    if cot_reasoning:
+        postprocessor = get_cot_postprocessor(model, for_extract=True)
+        parsed, explanations = postprocessor(llm_answers)
+        # CoT extract path returns dict[str, str]; normalize list fields below.
+        normalized: list[dict[str, Any]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                normalized.append({})
+                continue
+            normalized.append(dict(item))
+        return normalized, explanations
+
+    outputs: list[dict[str, Any]] = []
+    explanations: list[str | None] = []
+    for llm_answer in llm_answers:
+        try:
+            output = json.loads(llm_answer)
+            if not isinstance(output, dict):
+                output = {}
+        except json.JSONDecodeError:
+            lotus.logger.info(f"\t Failed to parse lineage answer: {llm_answer}")
+            output = {}
+        outputs.append(output)
+        explanations.append(output.get("rationale") if isinstance(output.get("rationale"), str) else None)
+    return outputs, explanations

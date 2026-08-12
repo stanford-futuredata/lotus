@@ -369,6 +369,65 @@ def df2text(df: pd.DataFrame, cols: list[str]) -> list[str]:
     return formatted_rows
 
 
+def lineage_formatter(
+    model: lotus.models.LM,
+    claim_text: str,
+    events_blob: str,
+    instruction: str | None = None,
+    max_evidence: int = 5,
+    strategy: ReasoningStrategy | None = None,
+) -> list[dict[str, str]]:
+    """Build chat messages for claim→event provenance selection.
+
+    The model must return JSON with:
+      - supported: bool
+      - evidence_event_ids: list[str] (event_id values from the numbered event list)
+      - lineage_path: ordered list of event_ids or tool names explaining the support chain
+      - rationale: short explanation
+    """
+    task = instruction or (
+        "Decide whether the claim is supported by the agent event stream. "
+        "If supported, select the minimal set of evidence events (by event_id) "
+        "that justify the claim, in causal order."
+    )
+    answer_schema = (
+        '{"supported": true|false, '
+        f'"evidence_event_ids": ["id1", ...] (at most {max_evidence}), '
+        '"lineage_path": ["id_or_tool", ...], '
+        '"rationale": "brief explanation"}'
+    )
+
+    if strategy in (ReasoningStrategy.COT, ReasoningStrategy.ZS_COT):
+        cot_instruction = cot_prompt_formatter(
+            reasoning_instructions="Check each event for evidence that entails or refutes the claim.",
+            answer_instructions=f"Provide valid JSON: {answer_schema}",
+        )
+        sys_instruction = (
+            "You are a claim-provenance judge over agent event streams.\n"
+            f"Task: {task}\n"
+            "Only use event_id values that appear in the event list.\n"
+            f"{cot_instruction}"
+        )
+    else:
+        sys_instruction = (
+            "You are a claim-provenance judge over agent event streams.\n"
+            f"Task: {task}\n"
+            "Only use event_id values that appear in the event list.\n"
+            f"Respond with valid JSON only: {answer_schema}"
+        )
+
+    user_content = f"[Claim]: «{claim_text}»\n\n[Events]:\n{events_blob}"
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": sys_instruction},
+        {"role": "user", "content": user_content},
+    ]
+
+    if strategy == ReasoningStrategy.ZS_COT and model.is_deepseek():
+        messages.append({"role": "user", "content": f"Instruction: {deepseek_cot_formatter()}"})
+
+    return messages
+
+
 def df2multimodal_info(df: pd.DataFrame, cols: list[str]) -> list[dict[str, Any]]:
     """
     Formats the given DataFrame into a string containing info from cols.

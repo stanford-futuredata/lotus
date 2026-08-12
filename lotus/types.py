@@ -155,6 +155,22 @@ class SemanticJoinOutput:
     stats: dict[str, Any] | None = None
 
 
+@dataclass
+class SemanticLineageOutput:
+    """Per-claim provenance results from ``sem_lineage``.
+
+    Each parallel list is aligned with the input claim rows.
+    """
+
+    supported: list[bool]
+    evidence_event_ids: list[list[str]]
+    evidence_texts: list[list[str]]
+    lineage_paths: list[list[str]]
+    raw_outputs: list[str]
+    explanations: list[str | None]
+    stats: dict[str, Any] | None = None
+
+
 class ProxyModel(Enum):
     HELPER_LM = "helper_lm"
     EMBEDDING_MODEL = "embedding_model"
