@@ -2,6 +2,7 @@
 
 from .base import BaseOptimizer
 from .cascade import CascadeOptimizer
+from .fusion import OperatorFusionOptimizer
 from .gepa_optimizer import GEPAOptimizer
 from .predicate_pushdown import PredicatePushdownOptimizer
 
@@ -12,5 +13,6 @@ __all__ = [
     "CascadeOptimizer",
     "DEFAULT_OPTIMIZERS",
     "GEPAOptimizer",
+    "OperatorFusionOptimizer",
     "PredicatePushdownOptimizer",
 ]

@@ -118,6 +118,46 @@ def _corpus_stats(corpus: "Corpus") -> str:
     )
 
 
+def suggest_adaptive_batching(
+    corpus: "Corpus",
+    *,
+    target_chars_per_shard: int = 6_000,
+    max_shard_size: int = 8,
+    min_units_for_batching: int = 4,
+    max_mean_chars_for_batching: int = 400,
+) -> tuple[str, int]:
+    """Suggest ``(strategy, shard_size)`` from corpus size / unit lengths.
+
+    Tiny many units → ``batched`` with a char-budgeted shard size; otherwise
+    ``per_unit`` with shard_size 1. Used by the heuristic planner and as a
+    post-pass when the LM planner leaves strategy unset.
+    """
+    n = len(corpus)
+    lengths = [len(u.content) for u in corpus.units]
+    if n < min_units_for_batching or not lengths:
+        return "per_unit", 1
+    mean = sum(lengths) / len(lengths)
+    if mean > max_mean_chars_for_batching:
+        return "per_unit", 1
+    size = max(2, min(max_shard_size, max(2, target_chars_per_shard // max(1, int(mean)))))
+    size = min(size, n)
+    return "batched", size
+
+
+def apply_adaptive_batching(plan: Plan, corpus: "Corpus", ops: Sequence[str]) -> Plan:
+    """Fill unset map/filter strategies using :func:`suggest_adaptive_batching`."""
+    strategy, shard_size = suggest_adaptive_batching(corpus)
+    changed = False
+    for op in ops:
+        if op in (MAP, FILTER) and op not in plan.strategies:
+            plan.strategies[op] = strategy
+            changed = True
+    if changed and strategy == "batched":
+        if plan.shard_size is None or plan.shard_size <= 1:
+            plan.shard_size = shard_size
+    return plan
+
+
 def _heuristic_instruction(op: str, task: str) -> str:
     if op == MAP:
         return f"For this shard, complete the task: {task}"
@@ -132,15 +172,22 @@ def _heuristic_instruction(op: str, task: str) -> str:
 
 
 def _heuristic_plan(
-    task: str, ops: Sequence[str], overrides: dict[str, str], cap: int
+    task: str,
+    ops: Sequence[str],
+    overrides: dict[str, str],
+    cap: int,
+    corpus: "Corpus | None" = None,
 ) -> Plan:
     instructions = {op: overrides.get(op) or _heuristic_instruction(op, task) for op in ops}
-    return Plan(
+    plan = Plan(
         ops=list(ops),
         instructions=instructions,
         shard_size=1,
         parallelism=min(4, cap),
     )
+    if corpus is not None:
+        plan = apply_adaptive_batching(plan, corpus, ops)
+    return plan
 
 
 def derive_plan(
@@ -151,15 +198,24 @@ def derive_plan(
     lm=None,
     overrides: dict[str, str] | None = None,
     parallelism_cap: int = DEFAULT_PARALLELISM_CAP,
+    adaptive_batching: bool = True,
 ) -> Plan:
-    """Derive a :class:`Plan` from a task + ops, via the LM planner with heuristic fallback."""
+    """Derive a :class:`Plan` from a task + ops, via the LM planner with heuristic fallback.
+
+    When ``adaptive_batching`` is True (default), fills unset map/filter strategies
+    from corpus length statistics (tiny units → batched shards).
+    """
     ops = list(ops) if ops is not None else list(DEFAULT_OPS)
     overrides = dict(overrides or {})
 
-    plan = _heuristic_plan(task, ops, overrides, parallelism_cap)
+    plan = _heuristic_plan(
+        task, ops, overrides, parallelism_cap, corpus=corpus if adaptive_batching else None
+    )
 
     # If every op is user-overridden, no LLM planning is needed.
     if all(op in overrides for op in ops):
+        if adaptive_batching:
+            plan = apply_adaptive_batching(plan, corpus, ops)
         return plan
 
     if lm is None:
@@ -191,7 +247,16 @@ def derive_plan(
         plan.parallelism = max(1, min(draft.parallelism, parallelism_cap))
     except Exception:  # planning is best-effort; fall back to heuristics
         pass
+
+    if adaptive_batching:
+        plan = apply_adaptive_batching(plan, corpus, ops)
     return plan
 
 
-__all__ = ["Plan", "derive_plan", "DEFAULT_PARALLELISM_CAP"]
+__all__ = [
+    "Plan",
+    "derive_plan",
+    "DEFAULT_PARALLELISM_CAP",
+    "suggest_adaptive_batching",
+    "apply_adaptive_batching",
+]
