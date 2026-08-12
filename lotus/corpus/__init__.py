@@ -91,6 +91,9 @@ class Corpus:
         order (default ``["map", "reduce"]``). ``map``/``filter`` are Corpus -> Corpus
         (chainable); ``reduce`` collapses the corpus to one answer and must be last.
         See ``pipeline.run_pipeline``.
+
+        The returned ``Result`` retains a flattened agent event log in ``events``
+        (tool calls + finals per shard/op); use ``result.events_dataframe()`` for a table.
         """
         from lotus.agentic.pipeline import run_pipeline
 
