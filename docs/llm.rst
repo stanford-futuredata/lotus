@@ -4,7 +4,7 @@ LLM
 Overview
 ---------
 The LM class is built on top of the LiteLLM library, and supports any model that is supported by LiteLLM.
-Example models include but not limited to: OpenAI, Ollama, vLLM
+Example models include but not limited to: OpenAI, Ollama, vLLM, OrcaRouter
 
 Example
 ---------
@@ -32,6 +32,24 @@ Creating a LM object to use Meta-Llama-3-8B-Instruct on vLLM
     from lotus.models import LM
     lm = LM(model='hosted_vllm/meta-llama/Meta-Llama-3-8B-Instruct',
         api_base='http://localhost:8000/v1',
+        max_ctx_len=8000,
+        max_tokens=1000)
+
+Creating a LM object to use gpt-4o-mini through `OrcaRouter <https://www.orcarouter.ai>`_
+
+`OrcaRouter <https://www.orcarouter.ai>`_ is an OpenAI-compatible model routing gateway that exposes 150+ models
+from OpenAI, Anthropic, Google, DeepSeek, Qwen, MiniMax and xAI behind a single endpoint and API key
+(`sk-orca-...`). Point the LM at its OpenAI-compatible endpoint with your own key.
+
+Note that LiteLLM strips the leading ``openai/`` provider prefix, so the model must be written
+``openai/openai/gpt-4o-mini`` for OrcaRouter to receive the namespaced ``openai/gpt-4o-mini`` id.
+
+.. code-block:: python
+
+    from lotus.models import LM
+    lm = LM(model="openai/openai/gpt-4o-mini",
+        api_base="https://api.orcarouter.ai/v1",
+        api_key="sk-orca-...",
         max_ctx_len=8000,
         max_tokens=1000)
 
